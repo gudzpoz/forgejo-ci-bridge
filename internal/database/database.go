@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
@@ -25,31 +25,145 @@ type Service interface {
 }
 
 type service struct {
-	db *sql.DB
+	logger *slog.Logger
+
+	rdb *sql.DB
+	wdb *sql.DB
 }
 
 var (
-	dburl      = os.Getenv("BLUEPRINT_DB_URL")
+	dbPath     = os.Getenv("DB_PATH")
 	dbInstance *service
 )
 
-func New() Service {
+func New(logger *slog.Logger) Service {
+	logger = logger.WithGroup("db")
+
 	// Reuse Connection
 	if dbInstance != nil {
 		return dbInstance
 	}
 
-	db, err := sql.Open("sqlite3", dburl)
+	isNew := false
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		isNew = true
+	}
+	url := "file:" + dbPath + "?_journal=WAL&_timeout=5000&_fk=true"
+	read_url := url + "&mode=ro"
+	write_url := url + "&mode=rwc&_txlock=immediate&_vacuum=incremental"
+
+	wdb, err := sql.Open("sqlite3", write_url)
 	if err != nil {
-		// This will not be a connection error, but a DSN parse error or
-		// another initialization error.
-		log.Fatal(err)
+		logger.Error("db open error", "err", err)
+		os.Exit(1)
+	}
+	wdb.SetMaxOpenConns(1)
+	wdb.SetMaxIdleConns(1)
+	// Hopefully a finite lifetime lets SQLite set checkpoints and free up WAL space
+	wdb.SetConnMaxLifetime(time.Hour * 12)
+	wdb.SetConnMaxIdleTime(0)
+
+	var rdb *sql.DB
+	rdb, err = sql.Open("sqlite3", read_url)
+	if err != nil {
+		logger.Error("db open error", "err", err)
+		os.Exit(1)
 	}
 
 	dbInstance = &service{
-		db: db,
+		logger: logger,
+
+		rdb: rdb,
+		wdb: wdb,
 	}
+
+	if isNew {
+		err = dbInstance.init()
+		if err != nil {
+			logger.Error("db init error", "err", err)
+			os.Exit(1)
+		}
+	}
+	if err = dbInstance.upgrade(); err != nil {
+		logger.Error("db upgrade error", "err", err)
+		os.Exit(1)
+	}
+
 	return dbInstance
+}
+
+func (s *service) init() error {
+	if _, err := s.wdb.Exec("CREATE TABLE config (key text PRIMARY KEY, value text)"); err != nil {
+		return err
+	}
+	if _, err := s.wdb.Exec("INSERT INTO config (key, value) VALUES ('dbversion', '0')"); err != nil {
+		return err
+	}
+	// Change to incremental vacuum
+	_, err := s.wdb.Exec("VACUUM")
+	return err
+}
+
+func (s *service) upgrade() error {
+	verStr, err := s.GetConfig("dbversion", "0")
+	if err != nil {
+		return err
+	}
+	ver, err := strconv.Atoi(verStr)
+	if err != nil {
+		return err
+	}
+
+	try := func(nextVer int, sqls ...string) error {
+		tx, err := s.wdb.Begin()
+		if err != nil {
+			return err
+		}
+		for _, sql := range sqls {
+			_, err = tx.Exec(sql)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		_, err = tx.Exec("UPDATE config SET value = ? WHERE key = ?", strconv.Itoa(nextVer), "dbversion")
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		return tx.Commit()
+	}
+
+	switch ver {
+	case 0:
+		if err := try(1); err != nil {
+			return err
+		}
+		fallthrough
+	case 1:
+		break
+	default:
+		return fmt.Errorf("unknown database version: %d", ver)
+	}
+	return nil
+}
+
+func (s *service) GetConfig(key string, defaultValue string) (string, error) {
+	var value string
+	err := s.rdb.QueryRow("SELECT value FROM config WHERE key = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return defaultValue, nil
+	}
+	return value, err
+}
+
+func (s *service) SetConfig(key string, value string) error {
+	_, err := s.wdb.Exec(
+		"INSERT INTO config (key, value) VALUES (?, ?)"+
+			" ON CONFLICT (key) DO UPDATE SET value = ?",
+		key, value, value,
+	)
+	return err
 }
 
 // Health checks the health of the database connection by pinging the database.
@@ -61,11 +175,12 @@ func (s *service) Health() map[string]string {
 	stats := make(map[string]string)
 
 	// Ping the database
-	err := s.db.PingContext(ctx)
+	err := s.wdb.PingContext(ctx)
 	if err != nil {
 		stats["status"] = "down"
 		stats["error"] = fmt.Sprintf("db down: %v", err)
-		log.Fatalf("db down: %v", err) // Log the error and terminate the program
+		s.logger.Error("health: db down", "err", err) // Log the error and terminate the program
+		os.Exit(1)
 		return stats
 	}
 
@@ -74,7 +189,7 @@ func (s *service) Health() map[string]string {
 	stats["message"] = "It's healthy"
 
 	// Get database stats (like open connections, in use, idle, etc.)
-	dbStats := s.db.Stats()
+	dbStats := s.wdb.Stats()
 	stats["open_connections"] = strconv.Itoa(dbStats.OpenConnections)
 	stats["in_use"] = strconv.Itoa(dbStats.InUse)
 	stats["idle"] = strconv.Itoa(dbStats.Idle)
@@ -108,6 +223,10 @@ func (s *service) Health() map[string]string {
 // If the connection is successfully closed, it returns nil.
 // If an error occurs while closing the connection, it returns the error.
 func (s *service) Close() error {
-	log.Printf("Disconnected from database: %s", dburl)
-	return s.db.Close()
+	s.logger.Info("disconnected", "db", dbPath)
+	err := s.wdb.Close()
+	if err := s.rdb.Close(); err != nil {
+		return err
+	}
+	return err
 }

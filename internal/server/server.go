@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -9,6 +11,7 @@ import (
 
 	_ "github.com/joho/godotenv/autoload"
 
+	"forgejo-ci-bridge/internal/client"
 	"forgejo-ci-bridge/internal/database"
 )
 
@@ -18,13 +21,18 @@ type Server struct {
 	db database.Service
 }
 
-func NewServer() *http.Server {
+func NewServer(ctx context.Context) *http.Server {
+	logger := slog.Default().WithGroup("ci")
+
 	port, _ := strconv.Atoi(os.Getenv("PORT"))
 	NewServer := &Server{
 		port: port,
 
-		db: database.New(),
+		db: database.New(logger),
 	}
+
+	client := client.New(logger)
+	client.EnsurePing(ctx)
 
 	// Declare Server config
 	server := &http.Server{
