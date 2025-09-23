@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"forgejo-ci-bridge/internal/database"
 	"log/slog"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	pingv1 "code.forgejo.org/forgejo/actions-proto/ping/v1"
 	"code.forgejo.org/forgejo/actions-proto/ping/v1/pingv1connect"
+	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
 	"code.forgejo.org/forgejo/actions-proto/runner/v1/runnerv1connect"
 	"connectrpc.com/connect"
 )
@@ -23,6 +25,12 @@ type Client struct {
 var (
 	host   = os.Getenv("FORGEJO")
 	client *Client
+	runner *runnerv1.Runner
+)
+
+const (
+	CLIENT_NAME = "forgejo-ci-bridge"
+	CLIENT_VER  = "0.1.0"
 )
 
 func New(logger *slog.Logger) *Client {
@@ -47,7 +55,7 @@ func New(logger *slog.Logger) *Client {
 }
 
 func (c *Client) EnsurePing(ctx context.Context) {
-	ping := "forgejo-ci-bridge"
+	ping := CLIENT_NAME
 	pong, err := client.Ping(ctx, connect.NewRequest(&pingv1.PingRequest{
 		Data: ping,
 	}))
@@ -60,4 +68,29 @@ func (c *Client) EnsurePing(ctx context.Context) {
 		os.Exit(1)
 	}
 	c.logger.Info("ping success", "pong", pong.Msg.Data)
+}
+
+func (c *Client) RegisterBridge(ctx context.Context, db database.Service) error {
+	if runner = db.LoadRunner(); runner == nil {
+		labels := strings.Split(os.Getenv("LABELS"), ",")
+		for i := range labels {
+			labels[i] = strings.TrimSpace(labels[i])
+		}
+		res, err := c.Register(ctx, connect.NewRequest(&runnerv1.RegisterRequest{
+			Name:      CLIENT_NAME,
+			Token:     os.Getenv("TOKEN"),
+			Version:   CLIENT_VER,
+			Labels:    labels,
+			Ephemeral: false,
+		}))
+		if err != nil {
+			return err
+		}
+		runner = res.Msg.Runner
+		if err := db.SaveRunner(runner); err != nil {
+			return err
+		}
+	}
+	c.logger.Info("using runner", "runner", runner)
+	return nil
 }

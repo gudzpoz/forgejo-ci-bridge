@@ -33,6 +33,10 @@ func NewServer(ctx context.Context) *http.Server {
 
 	client := client.New(logger)
 	client.EnsurePing(ctx)
+	if err := client.RegisterBridge(ctx, NewServer.db); err != nil {
+		logger.Error("unable to register runner", "err", err)
+		os.Exit(1)
+	}
 
 	// Declare Server config
 	server := &http.Server{

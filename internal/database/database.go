@@ -3,12 +3,14 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
 	"time"
 
+	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
 	_ "github.com/joho/godotenv/autoload"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -18,6 +20,9 @@ type Service interface {
 	// Health returns a map of health status information.
 	// The keys and values in the map are service-specific.
 	Health() map[string]string
+
+	LoadRunner() *runnerv1.Runner
+	SaveRunner(runner *runnerv1.Runner) error
 
 	// Close terminates the database connection.
 	// It returns an error if the connection cannot be closed.
@@ -164,6 +169,25 @@ func (s *service) SetConfig(key string, value string) error {
 		key, value, value,
 	)
 	return err
+}
+
+func (s *service) LoadRunner() *runnerv1.Runner {
+	encoded, err := s.GetConfig("runner", "")
+	if err != nil {
+		return nil
+	}
+	var runner runnerv1.Runner
+	if err := json.Unmarshal([]byte(encoded), &runner); err != nil {
+		return nil
+	}
+	return &runner
+}
+func (s *service) SaveRunner(runner *runnerv1.Runner) error {
+	bytes, err := json.Marshal(runner)
+	if err != nil {
+		return err
+	}
+	return s.SetConfig("runner", string(bytes))
 }
 
 // Health checks the health of the database connection by pinging the database.
