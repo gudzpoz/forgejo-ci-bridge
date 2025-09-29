@@ -24,6 +24,9 @@ type Service interface {
 	LoadRunner() *runnerv1.Runner
 	SaveRunner(runner *runnerv1.Runner) error
 
+	GetTaskVersion() int64
+	SetTaskVersion(version int64) error
+
 	// Close terminates the database connection.
 	// It returns an error if the connection cannot be closed.
 	Close() error
@@ -188,6 +191,15 @@ func (s *service) SaveRunner(runner *runnerv1.Runner) error {
 		return err
 	}
 	return s.SetConfig("runner", string(bytes))
+}
+
+func (s *service) GetTaskVersion() int64 {
+	ver, _ := s.GetConfig("taskver", "0")
+	i, _ := strconv.ParseInt(ver, 16, 64)
+	return i
+}
+func (s *service) SetTaskVersion(version int64) error {
+	return s.SetConfig("taskver", strconv.FormatInt(version, 16))
 }
 
 // Health checks the health of the database connection by pinging the database.

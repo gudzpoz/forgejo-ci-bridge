@@ -36,3 +36,6 @@ main
 *.db
 *.db-shm
 *.db-wal
+
+# Forgejo
+forgejo/

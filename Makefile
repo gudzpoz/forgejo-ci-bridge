@@ -5,13 +5,16 @@ all: build test
 
 build:
 	@echo "Building..."
-	
-	
 	@go build -o main cmd/api/main.go
 
 # Run the application
 run:
 	@go run cmd/api/main.go
+
+# Spin up a Forgejo instance
+forgejo:
+	@echo "Starting Forgejo server..."
+	env GITEA_WORK_DIR="$(CURDIR)/forgejo" forgejo web -c forgejo/app.ini
 
 # Test the application
 test:
