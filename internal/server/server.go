@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	_ "github.com/joho/godotenv/autoload"
@@ -26,22 +27,22 @@ type Server struct {
 
 	pollCtx    context.Context
 	pollCancel context.CancelFunc
-	pollEnd    chan bool
 }
 
-func NewServer(ctx context.Context) *Server {
-	logger := slog.Default().WithGroup("ci")
+func NewServer(logger *slog.Logger, ctx context.Context) *Server {
 	db := database.New(logger)
 
-	client := client.New(logger, db)
-	client.EnsurePing(ctx)
+	client, err := client.New(ctx, logger, db)
+	if err != nil {
+		logger.Error("unable to create client", "err", err)
+		os.Exit(1)
+	}
 	if err := client.RegisterBridge(ctx, db); err != nil {
 		logger.Error("unable to register runner", "err", err)
 		os.Exit(1)
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
-	pollEnd := make(chan bool)
 	port, _ := strconv.Atoi(os.Getenv("PORT"))
 	NewServer := &Server{
 		logger:     logger,
@@ -50,7 +51,6 @@ func NewServer(ctx context.Context) *Server {
 		client:     client,
 		pollCtx:    runCtx,
 		pollCancel: cancel,
-		pollEnd:    pollEnd,
 	}
 
 	// Declare Server config
@@ -69,17 +69,36 @@ func NewServer(ctx context.Context) *Server {
 }
 
 func (s *Server) ListenAndServe() error {
-	go func() {
+	tasks, err := s.db.QueryAllOpenTasks()
+	if err != nil {
+		return nil
+	}
+	var wg sync.WaitGroup
+	for i := range tasks {
+		tracker := client.NewTracker(*s.logger, tasks[i], s.client)
+		wg.Go(func() { tracker.Track(s.pollCtx) })
+	}
+	wg.Go(func() {
 		tasks := s.client.PollTasks(s.pollCtx, 0)
 		for task := range tasks {
 			s.logger.Info("execute task", "task", task)
+			info, err := s.db.PersistTask(task)
+			if err != nil {
+				s.logger.Error("unable to persist task", "err", err, "task", task)
+			} else {
+				tracker := client.NewTracker(*s.logger, info, s.client)
+				wg.Go(func() { tracker.Track(s.pollCtx) })
+			}
 		}
-	}()
-	return s.serv.ListenAndServe()
+		s.logger.Info("dispatcher exiting")
+
+	})
+	err = s.serv.ListenAndServe()
+	wg.Wait()
+	return err
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.serv.Shutdown(ctx)
-	<-s.pollEnd
 	return err
 }

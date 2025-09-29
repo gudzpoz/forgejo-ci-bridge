@@ -27,6 +27,10 @@ type Service interface {
 	GetTaskVersion() int64
 	SetTaskVersion(version int64) error
 
+	QueryAllOpenTasks() ([]*ForgejoTask, error)
+	PersistTask(task *runnerv1.Task) (*ForgejoTask, error)
+	UpdateTaskStatus(task *ForgejoTask) error
+
 	// Close terminates the database connection.
 	// It returns an error if the connection cannot be closed.
 	Close() error
@@ -149,6 +153,22 @@ func (s *service) upgrade() error {
 		}
 		fallthrough
 	case 1:
+		if err := try(2,
+			`CREATE TABLE tasks (
+			  id integer PRIMARY KEY,
+				repo text NOT NULL,
+				ref text NOT NULL,
+				sha text NOT NULL,
+				status integer NOT NULL,
+				loglines integer NOT NULL,
+				tracking integer NOT NULL,
+				workflow text NOT NULL
+			)`,
+		); err != nil {
+			return err
+		}
+		fallthrough
+	case 2:
 		break
 	default:
 		return fmt.Errorf("unknown database version: %d", ver)

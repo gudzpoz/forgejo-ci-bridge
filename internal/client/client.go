@@ -15,6 +15,7 @@ import (
 	"code.forgejo.org/forgejo/actions-proto/runner/v1/runnerv1connect"
 	"connectrpc.com/connect"
 	"golang.org/x/time/rate"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type Client struct {
@@ -24,6 +25,8 @@ type Client struct {
 
 	pingv1connect.PingServiceClient
 	runnerv1connect.RunnerServiceClient
+
+	gh *GitHubClient
 }
 
 var (
@@ -57,13 +60,18 @@ func clientAuth(next connect.UnaryFunc) connect.UnaryFunc {
 	}
 }
 
-func New(logger *slog.Logger, db database.Service) *Client {
+func New(ctx context.Context, logger *slog.Logger, db database.Service) (*Client, error) {
 	if client != nil {
-		return client
+		return client, nil
 	}
 
 	opts := []connect.ClientOption{
 		connect.WithInterceptors(connect.UnaryInterceptorFunc(clientAuth)),
+	}
+
+	gh, err := initGithubClient(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	if scheme != "http" {
@@ -72,7 +80,6 @@ func New(logger *slog.Logger, db database.Service) *Client {
 	url := scheme + "://" + host + "/api/actions"
 	client = &Client{
 		logger: logger.WithGroup("proto"),
-		db:     db,
 		PingServiceClient: pingv1connect.NewPingServiceClient(
 			http.DefaultClient,
 			url,
@@ -83,9 +90,12 @@ func New(logger *slog.Logger, db database.Service) *Client {
 			url,
 			opts...,
 		),
+		db: db,
+		gh: gh,
 	}
+	client.EnsurePing(ctx)
 
-	return client
+	return client, nil
 }
 
 func (c *Client) EnsurePing(ctx context.Context) {
@@ -165,6 +175,8 @@ func (c *Client) PollTasks(ctx context.Context, version int64) chan *runnerv1.Ta
 			select {
 			case <-ctx.Done():
 				close(channel)
+				c.logger.Info("poller exiting")
+				return
 			default:
 				if err := limiter.Wait(ctx); err != nil {
 					continue
@@ -179,10 +191,44 @@ func (c *Client) PollTasks(ctx context.Context, version int64) chan *runnerv1.Ta
 				if err := c.db.SetTaskVersion(taskVer); err != nil {
 					c.logger.Error("error persisting task version", "err", err)
 				}
-				c.logger.Info("next task", "taskver", task.Msg.Task.Id)
-				channel <- task.Msg.Task
+				if task.Msg.Task != nil {
+					c.logger.Info("next task", "taskver", task.Msg.Task.Id)
+					channel <- task.Msg.Task
+				}
 			}
 		}
 	}()
 	return channel
+}
+
+func (c *Client) PushLog(
+	ctx context.Context, task *database.ForgejoTask, rows []*runnerv1.LogRow,
+) error {
+	res, err := c.UpdateLog(ctx, connect.NewRequest(&runnerv1.UpdateLogRequest{
+		TaskId: task.Id,
+		Index:  task.LogIdx,
+		Rows:   rows,
+		NoMore: false,
+	}))
+	if err != nil {
+		return err
+	}
+	if res.Msg.AckIndex > task.LogIdx {
+		task.LogIdx = res.Msg.AckIndex
+	}
+	return nil
+}
+
+func (c *Client) MarkTaskDone(ctx context.Context, task *runnerv1.Task) error {
+	_, err := c.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
+		State: &runnerv1.TaskState{
+			Id:        task.Id,
+			Result:    runnerv1.Result_RESULT_SUCCESS,
+			StartedAt: timestamppb.Now(),
+			StoppedAt: timestamppb.Now(),
+			Steps:     []*runnerv1.StepState{},
+		},
+		Outputs: map[string]string{},
+	}))
+	return err
 }
