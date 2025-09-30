@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"forgejo-ci-bridge/internal/database"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -18,20 +17,19 @@ import (
 )
 
 var (
-	github_token = os.Getenv("GITHUB_TOKEN")
-	github_repo  = strings.Split(os.Getenv("GITHUB_REPO"), "/")
-	date_regxp   = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T`)
-	date_len     = len(time.DateOnly + "T")
+	date_regxp = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T`)
+	date_len   = len(time.DateOnly + "T")
 )
 
 type GitHubClient struct {
 	*github.Client
 
+	user  string
 	limit *rate.Limiter
 }
 
-func initGithubClient(ctx context.Context) (*GitHubClient, error) {
-	client := github.NewClient(nil).WithAuthToken(github_token)
+func initGithubClient(ctx context.Context, user string, token string) (*GitHubClient, error) {
+	client := github.NewClient(nil).WithAuthToken(token)
 	client.RateLimitRedirectionalEndpoints = true
 	limit, _, err := client.RateLimit.Get(ctx)
 	if err != nil {
@@ -39,15 +37,26 @@ func initGithubClient(ctx context.Context) (*GitHubClient, error) {
 	}
 	return &GitHubClient{
 		Client: client,
+		user:   user,
 		limit:  rate.NewLimiter(rate.Limit(float64(limit.Core.Limit)/3600), 1),
 	}, nil
 }
 
-func (c *Client) CheckExistence(ctx context.Context, sha string) error {
-	if err := c.gh.limit.Wait(ctx); err != nil {
+func (c *Client) getGitHubRepo(userSlashRepo string) (gh *GitHubClient, user string, repo string) {
+	info := strings.Split(userSlashRepo, "/")
+	joUser := info[0]
+	gh = c.gh[joUser]
+	user = gh.user
+	repo = info[1]
+	return
+}
+
+func (c *Client) CheckExistence(ctx context.Context, repo string, sha string) error {
+	gh, user, repo := c.getGitHubRepo(repo)
+	if err := gh.limit.Wait(ctx); err != nil {
 		return err
 	}
-	commits, _, err := c.gh.Repositories.ListCommits(ctx, github_repo[0], github_repo[1], &github.CommitsListOptions{
+	commits, _, err := gh.Repositories.ListCommits(ctx, user, repo, &github.CommitsListOptions{
 		SHA: sha,
 		ListOptions: github.ListOptions{
 			PerPage: 1,
@@ -63,13 +72,14 @@ func (c *Client) CheckExistence(ctx context.Context, sha string) error {
 }
 
 func (c *Client) CheckAssociatedWorkflowRuns(
-	ctx context.Context, task *database.ForgejoTask,
+	ctx context.Context, repo string, task *database.ForgejoTask,
 ) (*github.WorkflowRun, *github.WorkflowJob, error) {
-	if err := c.gh.limit.Wait(ctx); err != nil {
+	gh, user, repo := c.getGitHubRepo(repo)
+	if err := gh.limit.Wait(ctx); err != nil {
 		return nil, nil, err
 	}
-	runs, _, err := c.gh.Actions.ListWorkflowRunsByFileName(
-		ctx, github_repo[0], github_repo[1], task.Yml,
+	runs, _, err := gh.Actions.ListWorkflowRunsByFileName(
+		ctx, user, repo, task.Yml,
 		&github.ListWorkflowRunsOptions{
 			HeadSHA: task.Sha,
 			ListOptions: github.ListOptions{
@@ -84,8 +94,8 @@ func (c *Client) CheckAssociatedWorkflowRuns(
 		return nil, nil, fmt.Errorf("workflow run not found for: %s", task.Sha)
 	}
 	run := runs.WorkflowRuns[0]
-	jobs, _, err := c.gh.Actions.ListWorkflowJobs(
-		ctx, github_repo[0], github_repo[1], *run.ID,
+	jobs, _, err := gh.Actions.ListWorkflowJobs(
+		ctx, user, repo, *run.ID,
 		&github.ListWorkflowJobsOptions{},
 	)
 	if err != nil {
@@ -104,11 +114,12 @@ func (c *Client) CheckAssociatedWorkflowRuns(
 	return run, job, nil
 }
 
-func (c *Client) GetWorkflowRun(ctx context.Context, task *database.ForgejoTask) (*github.WorkflowRun, error) {
-	if err := c.gh.limit.Wait(ctx); err != nil {
+func (c *Client) GetWorkflowRun(ctx context.Context, repo string, task *database.ForgejoTask) (*github.WorkflowRun, error) {
+	gh, user, repo := c.getGitHubRepo(repo)
+	if err := gh.limit.Wait(ctx); err != nil {
 		return nil, err
 	}
-	run, _, err := c.gh.Actions.GetWorkflowRunByID(ctx, github_repo[0], github_repo[1], task.RunId)
+	run, _, err := gh.Actions.GetWorkflowRunByID(ctx, user, repo, task.RunId)
 	return run, err
 }
 
@@ -117,8 +128,9 @@ type GitHubWorkflowLog struct {
 	States []*runnerv1.StepState
 }
 
-func (c *Client) DownloadWorkflowLog(ctx context.Context, task *database.ForgejoTask) ([]*runnerv1.LogRow, error) {
-	url, _, err := c.gh.Actions.GetWorkflowJobLogs(ctx, github_repo[0], github_repo[1], task.JobId, 4)
+func (c *Client) DownloadWorkflowLog(ctx context.Context, repo string, task *database.ForgejoTask) ([]*runnerv1.LogRow, error) {
+	gh, user, repo := c.getGitHubRepo(repo)
+	url, _, err := gh.Actions.GetWorkflowJobLogs(ctx, user, repo, task.JobId, 4)
 	if err != nil {
 		return nil, err
 	}

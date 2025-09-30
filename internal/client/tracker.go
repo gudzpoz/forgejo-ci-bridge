@@ -86,6 +86,7 @@ func LightSleep(ctx context.Context, long time.Duration) {
 }
 
 func (t *Tracker) Track(ctx context.Context) {
+	repo := t.task.Repo
 	sync := func(status int64, msg string) {
 		t.logger.Info(msg, "sha", t.task.Sha)
 		t.task.Status = status
@@ -114,7 +115,7 @@ func (t *Tracker) Track(ctx context.Context) {
 	switch t.task.Status {
 	case StatusInit:
 		for ctx.Err() == nil {
-			if err := t.client.CheckExistence(ctx, t.task.Sha); err != nil {
+			if err := t.client.CheckExistence(ctx, repo, t.task.Sha); err != nil {
 				t.logger.Info("commit not found", "sha", t.task.Sha, "err", err)
 			} else {
 				break
@@ -129,7 +130,7 @@ func (t *Tracker) Track(ctx context.Context) {
 
 	case StatusPushed:
 		for ctx.Err() == nil {
-			run, job, err := t.client.CheckAssociatedWorkflowRuns(ctx, t.task)
+			run, job, err := t.client.CheckAssociatedWorkflowRuns(ctx, repo, t.task)
 			if err != nil {
 				t.logger.Info("workflow run not started", "sha", t.task.Sha, "err", err)
 			} else {
@@ -142,14 +143,15 @@ func (t *Tracker) Track(ctx context.Context) {
 		if ctx.Err() != nil {
 			break
 		}
+		repo := strings.Split(t.task.Repo, "/")
 		sync(StatusRunStarted, "GitHub Actions run started: "+
-			"https://github.com/"+github_repo[0]+"/"+github_repo[1]+
+			"https://github.com/"+t.client.gh[repo[0]].user+"/"+repo[1]+
 			"/actions/runs/"+strconv.FormatInt(t.task.RunId, 10))
 		fallthrough
 
 	case StatusRunStarted:
 		for {
-			if err := t.client.MarkTaskRunning(ctx, t.task.Task); err != nil {
+			if err := t.client.MarkTaskRunning(ctx, t.task); err != nil {
 				t.logger.Error("unable to mark task running", "sha", t.task.Sha, "err", err)
 			} else {
 				break
@@ -161,7 +163,7 @@ func (t *Tracker) Track(ctx context.Context) {
 		}
 		count := uint64(0)
 		for ctx.Err() == nil {
-			run, err := t.client.GetWorkflowRun(ctx, t.task)
+			run, err := t.client.GetWorkflowRun(ctx, repo, t.task)
 			if err != nil {
 				t.logger.Info("workflow run not found", "sha", t.task.Sha, "err", err)
 			} else if *run.Status == "completed" {
@@ -192,7 +194,7 @@ func (t *Tracker) Track(ctx context.Context) {
 		}
 		steps := file.getSteps(t.task.Job)
 
-		logs, err := t.client.DownloadWorkflowLog(ctx, t.task)
+		logs, err := t.client.DownloadWorkflowLog(ctx, repo, t.task)
 		if err != nil {
 			t.logger.Info("workflow log download failed", "sha", t.task.Sha, "err", err)
 		}
@@ -211,7 +213,7 @@ func (t *Tracker) Track(ctx context.Context) {
 			}
 		}
 		err = t.client.MarkTaskDone(
-			ctx, t.task.Task,
+			ctx, t.task,
 			mergeStepLogs(steps, logs, t.task.LogIdx-int64(len(logs))),
 		)
 		if err != nil {

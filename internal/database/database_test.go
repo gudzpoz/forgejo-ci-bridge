@@ -78,7 +78,7 @@ func TestTasks(t *testing.T) {
 			Context: &structpb.Struct{
 				Fields: fields,
 			},
-		})
+		}, "")
 		if err != nil || task.Repo != "REPOSITORY" || task.Sha != "SHA" {
 			t.Error("assert persist ok")
 		}

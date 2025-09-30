@@ -2,11 +2,13 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"forgejo-ci-bridge/internal/database"
 	"log/slog"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	pingv1 "code.forgejo.org/forgejo/actions-proto/ping/v1"
@@ -14,27 +16,41 @@ import (
 	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
 	"code.forgejo.org/forgejo/actions-proto/runner/v1/runnerv1connect"
 	"connectrpc.com/connect"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+type forgejoClient struct {
+	pingv1connect.PingServiceClient
+	runnerv1connect.RunnerServiceClient
+	token  string
+	runner *runnerv1.Runner
+}
+
+func (j *forgejoClient) clientAuth(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		if j.runner != nil {
+			req.Header().Set("x-runner-uuid", j.runner.Uuid)
+			req.Header().Set("x-runner-token", j.runner.Token)
+		}
+		return next(ctx, req)
+	}
+}
 
 type Client struct {
 	logger *slog.Logger
 
 	db database.Service
 
-	pingv1connect.PingServiceClient
-	runnerv1connect.RunnerServiceClient
-
-	gh *GitHubClient
+	jm map[string]*forgejoClient
+	jo []*forgejoClient
+	gh map[string]*GitHubClient
 }
 
 var (
-	scheme = os.Getenv("FORGEJO_SCHEME")
-	host   = os.Getenv("FORGEJO")
 	labels = loadLabels()
 	client *Client
-	runner *runnerv1.Runner
 )
 
 const (
@@ -50,46 +66,57 @@ func loadLabels() []string {
 	return labels
 }
 
-func clientAuth(next connect.UnaryFunc) connect.UnaryFunc {
-	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-		if runner != nil {
-			req.Header().Set("x-runner-uuid", runner.Uuid)
-			req.Header().Set("x-runner-token", runner.Token)
-		}
-		return next(ctx, req)
-	}
-}
-
 func New(ctx context.Context, logger *slog.Logger, db database.Service) (*Client, error) {
 	if client != nil {
 		return client, nil
 	}
 
-	opts := []connect.ClientOption{
-		connect.WithInterceptors(connect.UnaryInterceptorFunc(clientAuth)),
+	var forgejoUsers [][]string
+	err := json.Unmarshal([]byte(os.Getenv("FORGEJO_USERS")), &forgejoUsers)
+	if err != nil {
+		return nil, err
 	}
-
-	gh, err := initGithubClient(ctx)
+	var githubUsers map[string][]string
+	err = json.Unmarshal([]byte(os.Getenv("GITHUB_USERS")), &githubUsers)
 	if err != nil {
 		return nil, err
 	}
 
-	if scheme != "http" {
-		scheme = "https"
+	clients := make([]*forgejoClient, len(forgejoUsers))
+	mapping := make(map[string]*forgejoClient, len(forgejoUsers))
+	for i, user := range forgejoUsers {
+		url := user[0] + "/api/actions"
+		client := &forgejoClient{token: user[1]}
+		clients[i] = client
+		mapping[client.token] = client
+		opts := []connect.ClientOption{
+			connect.WithInterceptors(connect.UnaryInterceptorFunc(clients[i].clientAuth)),
+		}
+		client.PingServiceClient = pingv1connect.NewPingServiceClient(
+			http.DefaultClient,
+			url,
+			opts...,
+		)
+		client.RunnerServiceClient = runnerv1connect.NewRunnerServiceClient(
+			http.DefaultClient,
+			url,
+			opts...,
+		)
 	}
-	url := scheme + "://" + host + "/api/actions"
+
+	gh := make(map[string]*GitHubClient, len(githubUsers))
+	for joUser, ghInfo := range githubUsers {
+		ghClient, err := initGithubClient(ctx, ghInfo[0], ghInfo[1])
+		if err != nil {
+			return nil, err
+		}
+		gh[joUser] = ghClient
+	}
+
 	client = &Client{
 		logger: logger.WithGroup("proto"),
-		PingServiceClient: pingv1connect.NewPingServiceClient(
-			http.DefaultClient,
-			url,
-			opts...,
-		),
-		RunnerServiceClient: runnerv1connect.NewRunnerServiceClient(
-			http.DefaultClient,
-			url,
-			opts...,
-		),
+
+		jo: clients,
 		db: db,
 		gh: gh,
 	}
@@ -99,19 +126,25 @@ func New(ctx context.Context, logger *slog.Logger, db database.Service) (*Client
 }
 
 func (c *Client) EnsurePing(ctx context.Context) {
-	ping := CLIENT_NAME
-	pong, err := client.Ping(ctx, connect.NewRequest(&pingv1.PingRequest{
-		Data: ping,
-	}))
-	if err != nil {
-		c.logger.Error("ping error", "ping", ping, "err", err)
-		os.Exit(1)
+	wg := sync.WaitGroup{}
+	for i, client := range c.jo {
+		wg.Go(func() {
+			ping := CLIENT_NAME
+			pong, err := client.Ping(ctx, connect.NewRequest(&pingv1.PingRequest{
+				Data: ping,
+			}))
+			if err != nil {
+				c.logger.Error("ping error", "ping", ping, "err", err)
+				os.Exit(1)
+			}
+			if !strings.Contains(pong.Msg.Data, ping) {
+				c.logger.Error("unexpected pong", "ping", ping, "pong", pong.Msg.Data)
+				os.Exit(1)
+			}
+			c.logger.Info("ping success", "pong", pong.Msg.Data, "i", i)
+		})
 	}
-	if !strings.Contains(pong.Msg.Data, ping) {
-		c.logger.Error("unexpected pong", "ping", ping, "pong", pong.Msg.Data)
-		os.Exit(1)
-	}
-	c.logger.Info("ping success", "pong", pong.Msg.Data)
+	wg.Wait()
 }
 
 func needsUpdate(runner *runnerv1.Runner) bool {
@@ -132,79 +165,100 @@ func needsUpdate(runner *runnerv1.Runner) bool {
 }
 
 func (c *Client) RegisterBridge(ctx context.Context, db database.Service) error {
-	if runner = db.LoadRunner(); runner == nil {
-		c.logger.Info("registering", "name", CLIENT_NAME)
-		res, err := c.Register(ctx, connect.NewRequest(&runnerv1.RegisterRequest{
-			Name:      CLIENT_NAME,
-			Token:     os.Getenv("TOKEN"),
-			Version:   CLIENT_VER,
-			Labels:    labels,
-			Ephemeral: false,
-		}))
-		if err != nil {
-			return err
-		}
-		runner = res.Msg.Runner
-	} else if needsUpdate(runner) {
-		c.logger.Info("updating info", "labels", labels)
-		res, err := c.Declare(ctx, connect.NewRequest(&runnerv1.DeclareRequest{
-			Version: CLIENT_VER,
-			Labels:  labels,
-		}))
-		if err != nil {
-			return err
-		}
-		runner.Labels = res.Msg.Runner.Labels
-		runner.Version = res.Msg.Runner.Version
-	} else {
-		c.logger.Info("already registered", "name", runner.Name)
-	}
-	if err := db.SaveRunner(runner); err != nil {
-		return err
-	}
-	c.logger.Info("using runner", "runner", runner)
-	return nil
-}
-
-func (c *Client) PollTasks(ctx context.Context, version int64) chan *runnerv1.Task {
-	channel := make(chan *runnerv1.Task)
-	taskVer := c.db.GetTaskVersion()
-	go func() {
-		limiter := rate.NewLimiter(rate.Every(5*time.Second), 1)
-		for {
-			select {
-			case <-ctx.Done():
-				close(channel)
-				c.logger.Info("poller exiting")
-				return
-			default:
-				if err := limiter.Wait(ctx); err != nil {
-					continue
-				}
-				task, err := c.FetchTask(ctx, connect.NewRequest(&runnerv1.FetchTaskRequest{
-					TasksVersion: taskVer,
+	wg := errgroup.Group{}
+	for i, client := range c.jo {
+		wg.Go(func() error {
+			runner := db.LoadRunner(client.token)
+			if runner == nil {
+				c.logger.Info("registering", "name", CLIENT_NAME, "i", i)
+				res, err := client.Register(ctx, connect.NewRequest(&runnerv1.RegisterRequest{
+					Name:      CLIENT_NAME,
+					Token:     client.token,
+					Version:   CLIENT_VER,
+					Labels:    labels,
+					Ephemeral: false,
 				}))
 				if err != nil {
-					c.logger.Error("error fetching tasks", "err", err)
-					continue
+					return err
 				}
-				if err := c.db.SetTaskVersion(taskVer); err != nil {
-					c.logger.Error("error persisting task version", "err", err)
+				runner = res.Msg.Runner
+			} else if needsUpdate(runner) {
+				c.logger.Info("updating info", "labels", labels, "i", i)
+				res, err := client.Declare(ctx, connect.NewRequest(&runnerv1.DeclareRequest{
+					Version: CLIENT_VER,
+					Labels:  labels,
+				}))
+				if err != nil {
+					return err
 				}
-				if task.Msg.Task != nil {
-					c.logger.Info("next task", "taskver", task.Msg.Task.Id)
-					channel <- task.Msg.Task
+				runner.Labels = res.Msg.Runner.Labels
+				runner.Version = res.Msg.Runner.Version
+			} else {
+				c.logger.Info("already registered", "name", runner.Name, "i", i)
+			}
+			if err := db.SaveRunner(client.token, runner); err != nil {
+				return err
+			}
+			c.logger.Info("using runner", "runner", runner, "i", i)
+			return nil
+		})
+	}
+	return wg.Wait()
+}
+
+func (c *Client) PollTasks(ctx context.Context, version int64) chan *database.ForgejoTask {
+	channel := make(chan *database.ForgejoTask)
+	taskVer := c.db.GetTaskVersion()
+	wg := sync.WaitGroup{}
+	for i, client := range c.jo {
+		wg.Go(func() {
+			limiter := rate.NewLimiter(rate.Every(5*time.Second), 1)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					if err := limiter.Wait(ctx); err != nil {
+						continue
+					}
+					task, err := client.FetchTask(ctx, connect.NewRequest(&runnerv1.FetchTaskRequest{
+						TasksVersion: taskVer,
+					}))
+					if err != nil {
+						c.logger.Error("error fetching tasks", "err", err, "i", i)
+						continue
+					}
+					if err := c.db.SetTaskVersion(taskVer); err != nil {
+						c.logger.Error("error persisting task version", "err", err, "i", i)
+					}
+					if task.Msg.Task != nil {
+						c.logger.Info("next task", "taskver", task.Msg.Task.Id, "i", i)
+						channel <- &database.ForgejoTask{
+							Task:  task.Msg.Task,
+							Token: client.token,
+						}
+					}
 				}
 			}
-		}
+		})
+	}
+	go func() {
+		wg.Wait()
+		close(channel)
+		c.logger.Info("all poller exiting")
 	}()
 	return channel
+}
+
+func (c *Client) findClient(task *database.ForgejoTask) *forgejoClient {
+	return c.jm[task.Token]
 }
 
 func (c *Client) PushLog(
 	ctx context.Context, task *database.ForgejoTask, rows []*runnerv1.LogRow, nomore bool,
 ) error {
-	res, err := c.UpdateLog(ctx, connect.NewRequest(&runnerv1.UpdateLogRequest{
+	jc := c.findClient(task)
+	res, err := jc.UpdateLog(ctx, connect.NewRequest(&runnerv1.UpdateLogRequest{
 		TaskId: task.Id,
 		Index:  task.LogIdx,
 		Rows:   rows,
@@ -219,8 +273,9 @@ func (c *Client) PushLog(
 	return nil
 }
 
-func (c *Client) MarkTaskRunning(ctx context.Context, task *runnerv1.Task) error {
-	_, err := c.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
+func (c *Client) MarkTaskRunning(ctx context.Context, task *database.ForgejoTask) error {
+	jc := c.findClient(task)
+	_, err := jc.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
 		State: &runnerv1.TaskState{
 			Id:        task.Id,
 			StartedAt: timestamppb.Now(),
@@ -229,8 +284,9 @@ func (c *Client) MarkTaskRunning(ctx context.Context, task *runnerv1.Task) error
 	return err
 }
 
-func (c *Client) MarkTaskDone(ctx context.Context, task *runnerv1.Task, steps []*runnerv1.StepState) error {
-	_, err := c.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
+func (c *Client) MarkTaskDone(ctx context.Context, task *database.ForgejoTask, steps []*runnerv1.StepState) error {
+	jc := c.findClient(task)
+	_, err := jc.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
 		State: &runnerv1.TaskState{
 			Id:        task.Id,
 			Result:    runnerv1.Result_RESULT_SUCCESS,

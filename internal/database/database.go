@@ -21,14 +21,14 @@ type Service interface {
 	// The keys and values in the map are service-specific.
 	Health() map[string]string
 
-	LoadRunner() *runnerv1.Runner
-	SaveRunner(runner *runnerv1.Runner) error
+	LoadRunner(token string) *runnerv1.Runner
+	SaveRunner(token string, runner *runnerv1.Runner) error
 
 	GetTaskVersion() int64
 	SetTaskVersion(version int64) error
 
 	QueryAllOpenTasks() ([]*ForgejoTask, error)
-	PersistTask(task *runnerv1.Task) (*ForgejoTask, error)
+	PersistTask(task *runnerv1.Task, token string) (*ForgejoTask, error)
 	UpdateTaskStatus(task *ForgejoTask) error
 
 	// Close terminates the database connection.
@@ -195,8 +195,8 @@ func (s *service) SetConfig(key string, value string) error {
 	return err
 }
 
-func (s *service) LoadRunner() *runnerv1.Runner {
-	encoded, err := s.GetConfig("runner", "")
+func (s *service) LoadRunner(token string) *runnerv1.Runner {
+	encoded, err := s.GetConfig("runner_"+token, "")
 	if err != nil {
 		return nil
 	}
@@ -206,12 +206,12 @@ func (s *service) LoadRunner() *runnerv1.Runner {
 	}
 	return &runner
 }
-func (s *service) SaveRunner(runner *runnerv1.Runner) error {
+func (s *service) SaveRunner(token string, runner *runnerv1.Runner) error {
 	bytes, err := json.Marshal(runner)
 	if err != nil {
 		return err
 	}
-	return s.SetConfig("runner", string(bytes))
+	return s.SetConfig("runner_"+token, string(bytes))
 }
 
 func (s *service) GetTaskVersion() int64 {

@@ -82,7 +82,7 @@ func (s *Server) ListenAndServe() error {
 		tasks := s.client.PollTasks(s.pollCtx, 0)
 		for task := range tasks {
 			s.logger.Info("execute task", "task", task)
-			info, err := s.db.PersistTask(task)
+			info, err := s.db.PersistTask(task.Task, task.Token)
 			if err != nil {
 				s.logger.Error("unable to persist task", "err", err, "task", task)
 			} else {

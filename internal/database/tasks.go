@@ -17,6 +17,8 @@ type ForgejoTask struct {
 	Yml  string
 	Job  string
 
+	Token string
+
 	LogIdx int64
 	Status int64
 	RunId  int64
@@ -46,16 +48,16 @@ func ExtractTask(task *runnerv1.Task) *ForgejoTask {
 	}
 }
 
-func (s *service) PersistTask(task *runnerv1.Task) (*ForgejoTask, error) {
+func (s *service) PersistTask(task *runnerv1.Task, token string) (*ForgejoTask, error) {
 	info := ExtractTask(task)
 	bytes, err := json.Marshal(task)
 	if err != nil {
 		return nil, err
 	}
 	_, err = s.wdb.Exec(
-		`INSERT INTO tasks (id, repo, ref, sha, status, runid, jobid, loglines, workflow)
-		 VALUES (?,?,?,?,?,?,?,?,?)`,
-		info.Id, info.Repo, info.Ref, info.Sha, 0, 0, 0, 0, string(bytes),
+		`INSERT INTO tasks (id, repo, ref, sha, token, status, runid, jobid, loglines, workflow)
+		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		info.Id, info.Repo, info.Ref, info.Sha, token, 0, 0, 0, 0, string(bytes),
 	)
 	if err != nil {
 		return nil, err
@@ -65,7 +67,7 @@ func (s *service) PersistTask(task *runnerv1.Task) (*ForgejoTask, error) {
 
 func (s *service) QueryAllOpenTasks() ([]*ForgejoTask, error) {
 	rows, err := s.rdb.Query(
-		"SELECT status, runid, jobid, workflow FROM tasks WHERE status < ?",
+		"SELECT token, status, runid, jobid, workflow FROM tasks WHERE status < ?",
 		StatusDone,
 	)
 	if err != nil {
@@ -75,8 +77,8 @@ func (s *service) QueryAllOpenTasks() ([]*ForgejoTask, error) {
 	tasks := make([]*ForgejoTask, 0, 10)
 	for rows.Next() {
 		var status, run, job int64
-		var workflow string
-		if err := rows.Scan(&status, &run, &job, &workflow); err != nil {
+		var workflow, token string
+		if err := rows.Scan(&token, &status, &run, &job, &workflow); err != nil {
 			return nil, err
 		}
 		var task runnerv1.Task
