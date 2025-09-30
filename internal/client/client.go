@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,8 @@ type Client struct {
 }
 
 var (
+	pollSecs = os.Getenv("POLL_SECS")
+
 	labels = loadLabels()
 	client *Client
 )
@@ -213,11 +216,22 @@ func (c *Client) PollTasks(ctx context.Context, version int64) chan *database.Fo
 	c.logger.Info("starting pollers")
 	channel := make(chan *database.ForgejoTask)
 	taskVer := c.db.GetTaskVersion()
+	var interval time.Duration
+	if pollSecs != "" {
+		if i, err := strconv.ParseInt(pollSecs, 10, 64); err != nil {
+			c.logger.Error("wrong POLL_SECS config", "int", pollSecs)
+		} else {
+			interval = time.Duration(i) * time.Second
+		}
+	}
+	if interval == 0 {
+		interval = 30 * time.Second
+	}
 	wg := sync.WaitGroup{}
 	for i, client := range c.jo {
 		wg.Go(func() {
 			c.logger.Info("poller starting", "i", i)
-			limiter := rate.NewLimiter(rate.Every(5*time.Second), 1)
+			limiter := rate.NewLimiter(rate.Every(interval), 1)
 			for {
 				select {
 				case <-ctx.Done():

@@ -50,6 +50,7 @@ func ExtractTask(task *runnerv1.Task) *ForgejoTask {
 
 func (s *service) PersistTask(task *runnerv1.Task, token string) (*ForgejoTask, error) {
 	info := ExtractTask(task)
+	info.Token = token
 	bytes, err := json.Marshal(task)
 	if err != nil {
 		return nil, err

@@ -5,6 +5,7 @@ import (
 	"forgejo-ci-bridge/internal/database"
 	"log/slog"
 	"math/bits"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,15 @@ const (
 
 	StatusDone = database.StatusDone
 )
+
+var GitHubIncompleteStatus = []string{
+	"queued",
+	"in_progress",
+	"completed",
+	"waiting",
+	"requested",
+	"pending",
+}
 
 type stepInfo struct {
 	Run  *string `yaml:"run,omitempty"`
@@ -113,7 +123,7 @@ func (t *Tracker) Track(ctx context.Context) {
 	}
 
 	if client, ok := t.client.jm[t.task.Token]; !ok || client == nil {
-		t.logger.Error("not matching client found for task", "repo", t.task.Repo, "sha", t.task.Sha)
+		t.logger.Error("no matching client found for task", "repo", t.task.Repo, "sha", t.task.Sha)
 		sync(StatusDone, "")
 		return
 	}
@@ -175,6 +185,9 @@ func (t *Tracker) Track(ctx context.Context) {
 			} else if *run.Status == "completed" {
 				break
 			} else {
+				if !slices.Contains(GitHubIncompleteStatus, *run.Status) {
+					t.logger.Error("unknown workflow status", "status", *run.Status, "repo", t.task.Repo, "sha", t.task.Sha)
+				}
 				count++
 				sync(StatusRunStarted, "GitHub Actions still running: "+*run.Status)
 				if bits.OnesCount64(count) == 1 {
@@ -253,8 +266,8 @@ func mergeStepLogs(steps []string, logs []*runnerv1.LogRow, offset int64) []*run
 		states = append(states, &runnerv1.StepState{
 			Id:        int64(len(states)),
 			Result:    runnerv1.Result_RESULT_SUCCESS,
-			StartedAt: logs[max(min(from, len(logs)), 0)].Time,
-			StoppedAt: logs[max(min(to-1, len(logs)), 0)].Time,
+			StartedAt: logs[max(min(from, len(logs)-1), 0)].Time,
+			StoppedAt: logs[max(min(to-1, len(logs)-1), 0)].Time,
 			LogIndex:  int64(from) + offset,
 			LogLength: int64(to - from),
 		})
