@@ -1,39 +1,19 @@
-# Project forgejo-ci-bridge
+# `forgejo-ci-bridge`
 
-One Paragraph of project description goes here
+`forgejo-ci-bridge` mirrors build CI logs from a GitHub mirror repository
+to a Forgejo one.
 
-## Getting Started
+See [forgejo-ci-bridge/actions](https://codeberg.org/gudzpoz/forgejo-ci-bridge/actions)
+for an example.
 
-These instructions will get you a copy of the project up and running on your local machine for development and testing purposes. See deployment for notes on how to deploy the project on a live system.
+## TODO
 
-## MakeFile
+- [X] Support mirroring main branch push
+- [ ] Support PR-triggered builds
+- [ ] Support matrix runs
 
-Run build make command with tests
-```bash
-make all
-```
+## Usage
 
-Build the application
-```bash
-make build
-```
+1.  Copy `.env.example` to `.env` and modify the configurations.
 
-Run the application
-```bash
-make run
-```
-
-Live reload the application:
-```bash
-make watch
-```
-
-Run the test suite:
-```bash
-make test
-```
-
-Clean up binary from the last build:
-```bash
-make clean
-```
+2.  Run the application via `make run`.
