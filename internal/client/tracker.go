@@ -88,15 +88,15 @@ func LightSleep(ctx context.Context, long time.Duration) {
 func (t *Tracker) Track(ctx context.Context) {
 	repo := t.task.Repo
 	sync := func(status int64, msg string) {
-		t.logger.Info(msg, "sha", t.task.Sha)
 		t.task.Status = status
 		if err := t.client.db.UpdateTaskStatus(t.task); err != nil {
-			t.logger.Error("unable to sync task status", "sha", t.task.Sha, "status", status, "err", err)
+			t.logger.Error("unable to sync task status", "repo", t.task.Repo, "sha", t.task.Sha, "status", status, "err", err)
 		}
 
 		if msg == "" {
 			return
 		}
+		t.logger.Info(msg, "repo", t.task.Repo, "sha", t.task.Sha)
 		line := runnerv1.LogRow{
 			Time:    timestamppb.Now(),
 			Content: msg,
@@ -104,19 +104,25 @@ func (t *Tracker) Track(ctx context.Context) {
 		logs := []*runnerv1.LogRow{&line}
 		err := t.client.PushLog(ctx, t.task, logs, false)
 		if err != nil {
-			t.logger.Error("unable to push logs", "sha", t.task.Sha, "status", status, "err", err)
+			t.logger.Error("unable to push logs", "repo", t.task.Repo, "sha", t.task.Sha, "status", status, "err", err)
 		}
 
 		if err := t.client.db.UpdateTaskStatus(t.task); err != nil {
-			t.logger.Error("unable to sync task status", "sha", t.task.Sha, "status", status, "err", err)
+			t.logger.Error("unable to sync task status", "repo", t.task.Repo, "sha", t.task.Sha, "status", status, "err", err)
 		}
+	}
+
+	if client, ok := t.client.jm[t.task.Token]; !ok || client == nil {
+		t.logger.Error("not matching client found for task", "repo", t.task.Repo, "sha", t.task.Sha)
+		sync(StatusDone, "")
+		return
 	}
 
 	switch t.task.Status {
 	case StatusInit:
 		for ctx.Err() == nil {
 			if err := t.client.CheckExistence(ctx, repo, t.task.Sha); err != nil {
-				t.logger.Info("commit not found", "sha", t.task.Sha, "err", err)
+				t.logger.Info("commit not found", "repo", t.task.Repo, "sha", t.task.Sha, "err", err)
 			} else {
 				break
 			}
@@ -132,7 +138,7 @@ func (t *Tracker) Track(ctx context.Context) {
 		for ctx.Err() == nil {
 			run, job, err := t.client.CheckAssociatedWorkflowRuns(ctx, repo, t.task)
 			if err != nil {
-				t.logger.Info("workflow run not started", "sha", t.task.Sha, "err", err)
+				t.logger.Info("workflow run not started", "repo", t.task.Repo, "sha", t.task.Sha, "err", err)
 			} else {
 				t.task.RunId = *run.ID
 				t.task.JobId = *job.ID
@@ -152,7 +158,7 @@ func (t *Tracker) Track(ctx context.Context) {
 	case StatusRunStarted:
 		for {
 			if err := t.client.MarkTaskRunning(ctx, t.task); err != nil {
-				t.logger.Error("unable to mark task running", "sha", t.task.Sha, "err", err)
+				t.logger.Error("unable to mark task running", "repo", t.task.Repo, "sha", t.task.Sha, "err", err)
 			} else {
 				break
 			}
@@ -165,14 +171,14 @@ func (t *Tracker) Track(ctx context.Context) {
 		for ctx.Err() == nil {
 			run, err := t.client.GetWorkflowRun(ctx, repo, t.task)
 			if err != nil {
-				t.logger.Info("workflow run not found", "sha", t.task.Sha, "err", err)
+				t.logger.Info("workflow run not found", "repo", t.task.Repo, "sha", t.task.Sha, "err", err)
 			} else if *run.Status == "completed" {
 				break
 			} else {
 				count++
 				sync(StatusRunStarted, "GitHub Actions still running: "+*run.Status)
 				if bits.OnesCount64(count) == 1 {
-					t.logger.Info("workflow running...", "sha", t.task.Sha, "duration", count*30)
+					t.logger.Info("workflow running...", "repo", t.task.Repo, "sha", t.task.Sha, "duration", count*30)
 				}
 			}
 			LightSleep(ctx, 30*time.Second) // go slower
@@ -190,19 +196,19 @@ func (t *Tracker) Track(ctx context.Context) {
 	case StatusLogging:
 		var file workflowFile
 		if err := yaml.Unmarshal(t.task.WorkflowPayload, &file); err != nil {
-			t.logger.Info("workflow yaml parse failed", "sha", t.task.Sha, "err", err)
+			t.logger.Info("workflow yaml parse failed", "repo", t.task.Repo, "sha", t.task.Sha, "err", err)
 		}
 		steps := file.getSteps(t.task.Job)
 
 		logs, err := t.client.DownloadWorkflowLog(ctx, repo, t.task)
 		if err != nil {
-			t.logger.Info("workflow log download failed", "sha", t.task.Sha, "err", err)
+			t.logger.Info("workflow log download failed", "repo", t.task.Repo, "sha", t.task.Sha, "err", err)
 		}
 		if ctx.Err() != nil {
 			break
 		}
 		if err := t.client.PushLog(ctx, t.task, logs, true); err != nil {
-			t.logger.Info("workflow log sync failed", "sha", t.task.Sha, "err", err)
+			t.logger.Info("workflow log sync failed", "repo", t.task.Repo, "sha", t.task.Sha, "err", err)
 		}
 		if len(logs) == 0 {
 			logs = []*runnerv1.LogRow{
@@ -217,14 +223,14 @@ func (t *Tracker) Track(ctx context.Context) {
 			mergeStepLogs(steps, logs, t.task.LogIdx-int64(len(logs))),
 		)
 		if err != nil {
-			t.logger.Info("failed to mark task done", "sha", t.task.Sha, "err", err)
+			t.logger.Info("failed to mark task done", "repo", t.task.Repo, "sha", t.task.Sha, "err", err)
 		}
 		sync(StatusDone, "")
 		fallthrough
 
 	case StatusDone:
 	}
-	t.logger.Info("tracker exiting", "sha", t.task.Sha)
+	t.logger.Info("tracker exiting", "repo", t.task.Repo, "sha", t.task.Sha)
 }
 
 func mergeStepLogs(steps []string, logs []*runnerv1.LogRow, offset int64) []*runnerv1.StepState {

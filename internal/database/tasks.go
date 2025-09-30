@@ -86,6 +86,7 @@ func (s *service) QueryAllOpenTasks() ([]*ForgejoTask, error) {
 			return nil, err
 		}
 		info := ExtractTask(&task)
+		info.Token = token
 		info.Status = status
 		info.RunId = run
 		info.JobId = job

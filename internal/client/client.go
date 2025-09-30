@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"forgejo-ci-bridge/internal/database"
 	"log/slog"
 	"net/http"
@@ -116,8 +117,9 @@ func New(ctx context.Context, logger *slog.Logger, db database.Service) (*Client
 	client = &Client{
 		logger: logger.WithGroup("proto"),
 
-		jo: clients,
 		db: db,
+		jo: clients,
+		jm: mapping,
 		gh: gh,
 	}
 	client.EnsurePing(ctx)
@@ -199,6 +201,7 @@ func (c *Client) RegisterBridge(ctx context.Context, db database.Service) error 
 			if err := db.SaveRunner(client.token, runner); err != nil {
 				return err
 			}
+			client.runner = runner
 			c.logger.Info("using runner", "runner", runner, "i", i)
 			return nil
 		})
@@ -207,15 +210,18 @@ func (c *Client) RegisterBridge(ctx context.Context, db database.Service) error 
 }
 
 func (c *Client) PollTasks(ctx context.Context, version int64) chan *database.ForgejoTask {
+	c.logger.Info("starting pollers")
 	channel := make(chan *database.ForgejoTask)
 	taskVer := c.db.GetTaskVersion()
 	wg := sync.WaitGroup{}
 	for i, client := range c.jo {
 		wg.Go(func() {
+			c.logger.Info("poller starting", "i", i)
 			limiter := rate.NewLimiter(rate.Every(5*time.Second), 1)
 			for {
 				select {
 				case <-ctx.Done():
+					c.logger.Info("poller ending", "i", i)
 					return
 				default:
 					if err := limiter.Wait(ctx); err != nil {
@@ -251,7 +257,11 @@ func (c *Client) PollTasks(ctx context.Context, version int64) chan *database.Fo
 }
 
 func (c *Client) findClient(task *database.ForgejoTask) *forgejoClient {
-	return c.jm[task.Token]
+	client := c.jm[task.Token]
+	if client == nil {
+		panic(fmt.Sprintf(`client not found: "%s" (%v)`, task.Token, c.jm))
+	}
+	return client
 }
 
 func (c *Client) PushLog(

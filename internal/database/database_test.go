@@ -78,7 +78,7 @@ func TestTasks(t *testing.T) {
 			Context: &structpb.Struct{
 				Fields: fields,
 			},
-		}, "")
+		}, strconv.FormatInt(int64(i), 10))
 		if err != nil || task.Repo != "REPOSITORY" || task.Sha != "SHA" {
 			t.Error("assert persist ok")
 		}
@@ -87,8 +87,9 @@ func TestTasks(t *testing.T) {
 	if err != nil || len(tasks) != 100 {
 		t.Error("query error")
 	}
-	for _, task := range tasks {
-		if err != nil || task.Repo != "REPOSITORY" || task.Sha != "SHA" {
+	for i, task := range tasks {
+		if err != nil || task.Repo != "REPOSITORY" || task.Sha != "SHA" ||
+			task.Token != strconv.FormatInt(int64(i), 10) {
 			t.Error("assert persist ok")
 		}
 	}

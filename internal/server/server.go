@@ -71,7 +71,7 @@ func NewServer(logger *slog.Logger, ctx context.Context) *Server {
 func (s *Server) ListenAndServe() error {
 	tasks, err := s.db.QueryAllOpenTasks()
 	if err != nil {
-		return nil
+		return err
 	}
 	var wg sync.WaitGroup
 	for i := range tasks {
@@ -91,7 +91,6 @@ func (s *Server) ListenAndServe() error {
 			}
 		}
 		s.logger.Info("dispatcher exiting")
-
 	})
 	err = s.serv.ListenAndServe()
 	wg.Wait()

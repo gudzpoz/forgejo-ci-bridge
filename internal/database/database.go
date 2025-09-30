@@ -159,6 +159,7 @@ func (s *service) upgrade() error {
 				repo text NOT NULL,
 				ref text NOT NULL,
 				sha text NOT NULL,
+				token text NOT NULL,
 				status integer NOT NULL,
 				runid integer NOT NULL,
 				jobid integer NOT NULL,
@@ -197,7 +198,7 @@ func (s *service) SetConfig(key string, value string) error {
 
 func (s *service) LoadRunner(token string) *runnerv1.Runner {
 	encoded, err := s.GetConfig("runner_"+token, "")
-	if err != nil {
+	if err != nil || encoded == "" {
 		return nil
 	}
 	var runner runnerv1.Runner
