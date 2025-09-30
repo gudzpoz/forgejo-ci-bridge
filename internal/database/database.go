@@ -160,8 +160,9 @@ func (s *service) upgrade() error {
 				ref text NOT NULL,
 				sha text NOT NULL,
 				status integer NOT NULL,
+				runid integer NOT NULL,
+				jobid integer NOT NULL,
 				loglines integer NOT NULL,
-				tracking integer NOT NULL,
 				workflow text NOT NULL
 			)`,
 		); err != nil {

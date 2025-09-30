@@ -10,6 +10,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.32
 	golang.org/x/time v0.13.0
 	google.golang.org/protobuf v1.36.9
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require github.com/google/go-querystring v1.1.0 // indirect

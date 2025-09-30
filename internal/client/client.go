@@ -202,13 +202,13 @@ func (c *Client) PollTasks(ctx context.Context, version int64) chan *runnerv1.Ta
 }
 
 func (c *Client) PushLog(
-	ctx context.Context, task *database.ForgejoTask, rows []*runnerv1.LogRow,
+	ctx context.Context, task *database.ForgejoTask, rows []*runnerv1.LogRow, nomore bool,
 ) error {
 	res, err := c.UpdateLog(ctx, connect.NewRequest(&runnerv1.UpdateLogRequest{
 		TaskId: task.Id,
 		Index:  task.LogIdx,
 		Rows:   rows,
-		NoMore: false,
+		NoMore: nomore,
 	}))
 	if err != nil {
 		return err
@@ -219,16 +219,24 @@ func (c *Client) PushLog(
 	return nil
 }
 
-func (c *Client) MarkTaskDone(ctx context.Context, task *runnerv1.Task) error {
+func (c *Client) MarkTaskRunning(ctx context.Context, task *runnerv1.Task) error {
+	_, err := c.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
+		State: &runnerv1.TaskState{
+			Id:        task.Id,
+			StartedAt: timestamppb.Now(),
+		},
+	}))
+	return err
+}
+
+func (c *Client) MarkTaskDone(ctx context.Context, task *runnerv1.Task, steps []*runnerv1.StepState) error {
 	_, err := c.UpdateTask(ctx, connect.NewRequest(&runnerv1.UpdateTaskRequest{
 		State: &runnerv1.TaskState{
 			Id:        task.Id,
 			Result:    runnerv1.Result_RESULT_SUCCESS,
-			StartedAt: timestamppb.Now(),
 			StoppedAt: timestamppb.Now(),
-			Steps:     []*runnerv1.StepState{},
+			Steps:     steps,
 		},
-		Outputs: map[string]string{},
 	}))
 	return err
 }

@@ -20,6 +20,7 @@ type ForgejoTask struct {
 	LogIdx int64
 	Status int64
 	RunId  int64
+	JobId  int64
 }
 
 func ExtractTask(task *runnerv1.Task) *ForgejoTask {
@@ -41,6 +42,7 @@ func ExtractTask(task *runnerv1.Task) *ForgejoTask {
 		LogIdx: 0,
 		Status: 0,
 		RunId:  0,
+		JobId:  0,
 	}
 }
 
@@ -51,9 +53,9 @@ func (s *service) PersistTask(task *runnerv1.Task) (*ForgejoTask, error) {
 		return nil, err
 	}
 	_, err = s.wdb.Exec(
-		`INSERT INTO tasks (id, repo, ref, sha, status, loglines, tracking, workflow)
-		 VALUES (?,?,?,?,?,?,?,?)`,
-		info.Id, info.Repo, info.Ref, info.Sha, 0, 0, 0, string(bytes),
+		`INSERT INTO tasks (id, repo, ref, sha, status, runid, jobid, loglines, workflow)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		info.Id, info.Repo, info.Ref, info.Sha, 0, 0, 0, 0, string(bytes),
 	)
 	if err != nil {
 		return nil, err
@@ -63,7 +65,7 @@ func (s *service) PersistTask(task *runnerv1.Task) (*ForgejoTask, error) {
 
 func (s *service) QueryAllOpenTasks() ([]*ForgejoTask, error) {
 	rows, err := s.rdb.Query(
-		"SELECT status, tracking, workflow FROM tasks WHERE status < ?",
+		"SELECT status, runid, jobid, workflow FROM tasks WHERE status < ?",
 		StatusDone,
 	)
 	if err != nil {
@@ -72,9 +74,9 @@ func (s *service) QueryAllOpenTasks() ([]*ForgejoTask, error) {
 	defer rows.Close()
 	tasks := make([]*ForgejoTask, 0, 10)
 	for rows.Next() {
-		var status, run int64
+		var status, run, job int64
 		var workflow string
-		if err := rows.Scan(&status, &run, &workflow); err != nil {
+		if err := rows.Scan(&status, &run, &job, &workflow); err != nil {
 			return nil, err
 		}
 		var task runnerv1.Task
@@ -84,6 +86,7 @@ func (s *service) QueryAllOpenTasks() ([]*ForgejoTask, error) {
 		info := ExtractTask(&task)
 		info.Status = status
 		info.RunId = run
+		info.JobId = job
 		tasks = append(tasks, info)
 	}
 	return tasks, nil
@@ -91,8 +94,8 @@ func (s *service) QueryAllOpenTasks() ([]*ForgejoTask, error) {
 
 func (s *service) UpdateTaskStatus(task *ForgejoTask) error {
 	_, err := s.wdb.Exec(
-		"UPDATE tasks SET status = ?, loglines = ?, tracking = ? WHERE id = ?",
-		task.Status, task.LogIdx, task.RunId, task.Id,
+		"UPDATE tasks SET status = ?, loglines = ?, runid = ?, jobid = ? WHERE id = ?",
+		task.Status, task.LogIdx, task.RunId, task.JobId, task.Id,
 	)
 	return err
 }

@@ -1,23 +1,27 @@
 package client
 
 import (
-	"archive/zip"
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"forgejo-ci-bridge/internal/database"
-	"io"
+	"net/http"
 	"os"
+	"regexp"
 	"strings"
+	"time"
 
+	runnerv1 "code.forgejo.org/forgejo/actions-proto/runner/v1"
 	"github.com/google/go-github/v75/github"
 	"golang.org/x/time/rate"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var (
 	github_token = os.Getenv("GITHUB_TOKEN")
 	github_repo  = strings.Split(os.Getenv("GITHUB_REPO"), "/")
+	date_regxp   = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T`)
+	date_len     = len(time.DateOnly + "T")
 )
 
 type GitHubClient struct {
@@ -27,8 +31,8 @@ type GitHubClient struct {
 }
 
 func initGithubClient(ctx context.Context) (*GitHubClient, error) {
-	client := github.NewClient(nil)
-	client.WithAuthToken(github_token)
+	client := github.NewClient(nil).WithAuthToken(github_token)
+	client.RateLimitRedirectionalEndpoints = true
 	limit, _, err := client.RateLimit.Get(ctx)
 	if err != nil {
 		return nil, err
@@ -60,9 +64,9 @@ func (c *Client) CheckExistence(ctx context.Context, sha string) error {
 
 func (c *Client) CheckAssociatedWorkflowRuns(
 	ctx context.Context, task *database.ForgejoTask,
-) (*github.WorkflowRun, error) {
+) (*github.WorkflowRun, *github.WorkflowJob, error) {
 	if err := c.gh.limit.Wait(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	runs, _, err := c.gh.Actions.ListWorkflowRunsByFileName(
 		ctx, github_repo[0], github_repo[1], task.Yml,
@@ -74,12 +78,30 @@ func (c *Client) CheckAssociatedWorkflowRuns(
 		},
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if *runs.TotalCount == 0 {
-		return nil, fmt.Errorf("workflow run not found for: %s", task.Sha)
+		return nil, nil, fmt.Errorf("workflow run not found for: %s", task.Sha)
 	}
-	return runs.WorkflowRuns[0], nil
+	run := runs.WorkflowRuns[0]
+	jobs, _, err := c.gh.Actions.ListWorkflowJobs(
+		ctx, github_repo[0], github_repo[1], *run.ID,
+		&github.ListWorkflowJobsOptions{},
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	var job *github.WorkflowJob
+	job = nil
+	for _, j := range jobs.Jobs {
+		if *j.Name == task.Job {
+			job = j
+		}
+	}
+	if job == nil {
+		return nil, nil, fmt.Errorf("no matching job found for %s", task.Job)
+	}
+	return run, job, nil
 }
 
 func (c *Client) GetWorkflowRun(ctx context.Context, task *database.ForgejoTask) (*github.WorkflowRun, error) {
@@ -90,39 +112,66 @@ func (c *Client) GetWorkflowRun(ctx context.Context, task *database.ForgejoTask)
 	return run, err
 }
 
-func (c *Client) DownloadWorkflowLog(ctx context.Context, task *database.ForgejoTask) ([]string, error) {
-	url, _, err := c.gh.Actions.GetWorkflowRunLogs(ctx, github_repo[0], github_repo[1], task.RunId, 8)
+type GitHubWorkflowLog struct {
+	Steps  []string
+	States []*runnerv1.StepState
+}
+
+func (c *Client) DownloadWorkflowLog(ctx context.Context, task *database.ForgejoTask) ([]*runnerv1.LogRow, error) {
+	url, _, err := c.gh.Actions.GetWorkflowJobLogs(ctx, github_repo[0], github_repo[1], task.JobId, 4)
 	if err != nil {
 		return nil, err
 	}
-	res, err := c.gh.Client.Client().Get(url.String())
+	res, err := http.DefaultClient.Get(url.String())
 	if err != nil {
 		return nil, err
 	}
-	buff := bytes.NewBuffer([]byte{})
-	_, err = io.Copy(buff, res.Body)
-	res.Body.Close()
-	if err != nil {
-		return nil, err
+	defer func() {
+		if err := res.Body.Close(); err != nil {
+			c.logger.Error("error closing conn", "url", url.String())
+		}
+	}()
+
+	logs := make([]*runnerv1.LogRow, 0, 100)
+	var at time.Time
+	sb := make([]string, 0, 10)
+	commit := func() {
+		if len(sb) != 0 {
+			content := strings.Join(sb, "\n")
+			logs = append(logs, &runnerv1.LogRow{
+				Time:    timestamppb.New(at),
+				Content: content,
+			})
+		}
+		sb = sb[0:0]
 	}
-	unzip, err := zip.NewReader(bytes.NewReader(buff.Bytes()), int64(len(buff.Bytes())))
-	if err != nil {
-		return nil, err
-	}
-	lines := make([]string, 0, 100)
-	for _, f := range unzip.File {
-		rc, err := f.Open()
+	proc := func(line string) string {
+		if len(line) == 0 ||
+			line[0] < '0' || '9' < line[0] ||
+			!date_regxp.MatchString(line[0:min(len(line), date_len)]) {
+			return line
+		}
+		end := strings.Index(line[0:min(64, len(line))], " ")
+		if end == -1 {
+			return line
+		}
+		when, err := time.Parse(time.RFC3339Nano, line[0:end])
 		if err != nil {
-			return lines, err
+			return line
 		}
-		defer rc.Close()
-		sc := bufio.NewScanner(rc)
-		for sc.Scan() {
-			lines = append(lines, sc.Text())
-		}
-		if err := sc.Err(); err != nil {
-			return lines, err
-		}
+		commit()
+		at = when
+		return line[end+1:]
 	}
-	return lines, nil
+
+	sc := bufio.NewScanner(res.Body)
+	for sc.Scan() {
+		line := sc.Text()
+		sb = append(sb, proc(line))
+	}
+	commit()
+	if err := sc.Err(); err != nil {
+		return logs, err
+	}
+	return logs, nil
 }
